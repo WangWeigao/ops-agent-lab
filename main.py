@@ -1,4 +1,4 @@
-"""阶段 1 · 第 1–2 课：最小 Agent 循环 + 上下文管理（同步版，不用任何 Agent 框架）
+"""阶段 1 · 第 1–3 课：最小 Agent 循环 + 上下文管理 + 重复调用检测（同步版，不用任何 Agent 框架）
 
 运行前：
     uv sync
@@ -14,7 +14,8 @@ from openai import OpenAI
 import jsonschema
 from dotenv import load_dotenv
 
-from context import manage_context
+from context import manage_context, summarize_context
+from guard import RepeatGuard, Verdict
 
 load_dotenv()
 client = OpenAI(
@@ -142,6 +143,34 @@ def run_tool(name: str, args_json: str) -> str:
         return _format_error_message(f"{type(e).__name__}: {str(e)[:200]}")
 
 
+SUMMARY_PROMPT = """你是运维排查记录员。下面是一段 Agent 排查过程（工具调用及其结果）。
+请提炼成简洁的排查摘要，供 Agent 继续排查时参考：
+- 已查过哪些主机、哪些工具（写明参数），避免重复查询
+- 每项查询的关键发现，保留具体数值和原始的 ERROR/WARN 日志行
+- 反常或互相矛盾的细节要保留，不要当作噪音丢掉
+- 不要推测结论，只记录事实
+"""
+
+
+def summarize_steps(steps: list) -> str:
+    """策略③的 summarize 实现：额外调用一次模型生成摘要。"""
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SUMMARY_PROMPT},
+            {"role": "user", "content": json.dumps(steps, ensure_ascii=False)},
+        ],
+    )
+    summary = resp.choices[0].message.content
+    logger.info(f"生成摘要（{resp.usage.prompt_tokens} → {resp.usage.completion_tokens} tokens）:\n{summary}")
+    return summary
+
+
+def compress(messages: list, last_prompt_tokens: int) -> list:
+    """第 2 课用策略①，第 3 课切换为策略③。"""
+    # return manage_context(messages, last_prompt_tokens)
+    return summarize_context(messages, last_prompt_tokens, summarize_steps)
+
 
 def run_agent(user_input: str) -> str:
     messages = [
@@ -150,10 +179,11 @@ def run_agent(user_input: str) -> str:
     ]
 
     last_prompt_tokens = 0
+    guard = RepeatGuard()
     for step in range(MAX_STEPS):
         logger.info(f'执行Agent循环---{step}')
         # 第 2 课：每次请求前按上一次的 prompt_tokens 判断是否压缩
-        messages = manage_context(messages, last_prompt_tokens)
+        messages = compress(messages, last_prompt_tokens)
         # 在压缩之后、请求之前打印，看到的就是实际发给模型的内容
         logger.info(f"messages: {json.dumps(messages, indent=2, ensure_ascii=False)}")
         resp = client.chat.completions.create(
@@ -183,12 +213,25 @@ def run_agent(user_input: str) -> str:
             func_args = tool.function.arguments
             logger.info(f'func_name: {func_name}')
             logger.info(f'func_args: {func_args}')
-            content = run_tool(func_name, func_args)
+            # 第 3 课：执行前先检查是否重复查询
+            verdict, n = guard.check(func_name, func_args)
+            if verdict is Verdict.STOP:
+                logger.warning(f"重复调用 {func_name} {func_args} 第 {n} 次，中止任务")
+                return f"检测到重复调用（{func_name} 第 {n} 次），任务中止，请人工介入"
+            if verdict is Verdict.WARN:
+                # 不执行工具，但必须回一条 tool 消息，否则 tool_call_id 配对会断
+                logger.warning(f"重复调用 {func_name} {func_args} 第 {n} 次，返回提醒")
+                content = _format_error_message(
+                    f"重复查询：这是第 {n} 次以相同目标调用 {func_name}，未执行。"
+                    f"之前的结果可能已被压缩，请查看以 [早期排查摘要] 开头的消息；"
+                    f"信息足够就直接给出结论，再次重复将中止任务。"
+                )
+            else:
+                content = run_tool(func_name, func_args)
             logger.info(f'tool_call_response: {content}')
             messages.append({
                 "role": "tool", "tool_call_id": tool.id, "content": content
             })
-
 
     return "达到最大步数，任务未完成"
 

@@ -4,7 +4,7 @@
 """
 import copy
 
-from context import CONTEXT_THRESHOLD, PLACEHOLDER, manage_context
+from context import CONTEXT_THRESHOLD, PLACEHOLDER, SUMMARY_PREFIX, manage_context, summarize_context
 
 
 def step(n: int, call_ids: list[str]) -> list[dict]:
@@ -89,6 +89,35 @@ def main() -> None:
             results.append(check(f"只有 {n_steps} 步时不报错、不替换", out == msgs))
         except Exception as e:
             results.append(check(f"只有 {n_steps} 步时不报错、不替换", False, f"{type(e).__name__}: {e}"))
+
+    # ---------- 策略③：summarize_context ----------
+    print("\n-- summarize_context --")
+    seen = []
+
+    def fake_summarize(steps: list) -> str:
+        seen.append(steps)
+        return "web-01 磁盘 91%"
+
+    original = build_messages()
+    frozen = copy.deepcopy(original)
+    out = summarize_context(original, CONTEXT_THRESHOLD + 1, fake_summarize)
+
+    results.append(check("不修改传入的 messages", original == frozen))
+    results.append(check("未超阈值时不调用 summarize",
+                         summarize_context(original, CONTEXT_THRESHOLD, fake_summarize) == original
+                         and len(seen) == 1))
+    passed_ids = [m.get("tool_call_id") for m in (seen[0] if seen else []) if m["role"] == "tool"]
+    results.append(check("交给 summarize 的是 step1、step2 的整步", passed_ids == ["a", "b", "c"],
+                         f"实际: {passed_ids}"))
+    results.append(check("结构：system、user、摘要，再接最近 2 步",
+                         out[:2] == frozen[:2]
+                         and out[2] == {"role": "user", "content": f"{SUMMARY_PREFIX}\nweb-01 磁盘 91%"}
+                         and out[3:] == frozen[-5:],
+                         f"实际 roles: {[m['role'] for m in out]}"))
+    remaining = {m["tool_call_id"] for m in out if m["role"] == "tool"}
+    declared = {tc["id"] for m in out if m["role"] == "assistant" for tc in m.get("tool_calls", [])}
+    results.append(check("剩余的 tool 结果和 tool_calls 一一配对", remaining == declared,
+                         f"tool: {remaining} / calls: {declared}"))
 
     print(f"\n{sum(results)}/{len(results)} 通过")
 
