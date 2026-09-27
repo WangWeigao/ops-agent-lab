@@ -14,9 +14,6 @@ dependencies = [
     "python-dotenv>=1.2.3",
 ]
 
-[project.scripts]
-code = "code:main"
-
-[build-system]
-requires = ["uv_build>=0.12.19,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+# 只是学习用的脚本集合，不构建成包（包名 code 会遮蔽标准库的 code 模块，导致 debugpy 报错）
+package = false

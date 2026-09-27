@@ -1,4 +1,4 @@
-"""阶段 1 · 第 1 课：最小 Agent 循环（同步版，不用任何 Agent 框架）
+"""阶段 1 · 第 1–2 课：最小 Agent 循环 + 上下文管理（同步版，不用任何 Agent 框架）
 
 运行前：
     uv sync
@@ -14,13 +14,15 @@ from openai import OpenAI
 import jsonschema
 from dotenv import load_dotenv
 
+from context import manage_context
+
 load_dotenv()
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
     base_url="https://api.deepseek.com",
 )
 MODEL = "deepseek-flash"
-MAX_STEPS = 8
+MAX_STEPS = 12
 
 
 # ---------- 工具：实现 + 描述（schema） ----------
@@ -32,7 +34,30 @@ def check_disk(host: str) -> dict:
     return {"host": host, "usage_percent": fake[host]}
 
 
-TOOLS = {"check_disk": check_disk}
+def get_logs(host: str, lines: int = 40) -> str:
+    """模拟日志，故意返回较长内容，用来触发上下文压缩。"""
+    templates = {
+        "web-01": [
+            "INFO  nginx upstream response time 1.2s /api/orders",
+            "WARN  nginx upstream response time 4.8s /api/orders",
+            "ERROR app write /var/log/app/access.log failed: No space left on device",
+            "WARN  app db query slow (3.1s): SELECT * FROM orders WHERE user_id=?",
+            "INFO  app GC pause 120ms",
+        ],
+        "db-01": [
+            "INFO  mysqld slow query 2.9s: SELECT * FROM orders WHERE user_id=? (rows examined 1.2M)",
+            "WARN  mysqld missing index on orders.user_id",
+            "INFO  mysqld connections 180/500",
+            "INFO  mysqld innodb buffer pool hit rate 97.1%",
+        ],
+    }
+    if host not in templates:
+        raise ValueError(f"unknown host: {host}，可用主机: {list(templates)}")
+    rows = templates[host]
+    return "\n".join(f"2026-09-27 10:{i // 60:02d}:{i % 60:02d} {rows[i % len(rows)]}" for i in range(lines))
+
+
+TOOLS = {"check_disk": check_disk, "get_logs": get_logs}
 
 TOOL_SCHEMAS = [
     {
@@ -50,7 +75,23 @@ TOOL_SCHEMAS = [
                 "additionalProperties": False,
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_logs",
+            "description": "获取指定主机最近的应用/数据库日志",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "主机名，如 web-01"},
+                    "lines": {"type": "integer", "description": "返回行数，默认 40", "minimum": 1, "maximum": 200},
+                },
+                "required": ["host"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 # 按工具名索引 schema，避免每次都遍历列表
@@ -108,11 +149,18 @@ def run_agent(user_input: str) -> str:
         {"role": "user", "content": user_input},
     ]
 
+    last_prompt_tokens = 0
     for step in range(MAX_STEPS):
         logger.info(f'执行Agent循环---{step}')
+        # 第 2 课：每次请求前按上一次的 prompt_tokens 判断是否压缩
+        messages = manage_context(messages, last_prompt_tokens)
+        # 在压缩之后、请求之前打印，看到的就是实际发给模型的内容
+        logger.info(f"messages: {json.dumps(messages, indent=2, ensure_ascii=False)}")
         resp = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOL_SCHEMAS
         )
+        last_prompt_tokens = resp.usage.prompt_tokens
+        logger.info(f'prompt_tokens: {last_prompt_tokens}')
 
         msg = resp.choices[0].message
         logger.info(f'执行Agent循环---获取结果1: {msg.model_dump(exclude_none=True)}')
@@ -140,12 +188,14 @@ def run_agent(user_input: str) -> str:
             messages.append({
                 "role": "tool", "tool_call_id": tool.id, "content": content
             })
-            logger.info(f"messages: {json.dumps(messages, indent=2, ensure_ascii=False)}")
+
 
     return "达到最大步数，任务未完成"
 
 
 if __name__ == "__main__":
-    print(run_agent("web-01 和 db-01 的磁盘哪个需要处理？"))
-    # 做完 TODO 1 后，再试这句，验证错误处理是否生效：
+    # 第 1 课
+    # print(run_agent("web-01 和 db-01 的磁盘哪个需要处理？"))
     # print(run_agent("查一下 cache-01 的磁盘"))
+    # 第 2 课：需要多步排查、会拉多次日志，用来触发上下文压缩
+    print(run_agent("web-01 上的订单接口最近很慢，帮我排查根因。先看 web-01 的日志和磁盘，再根据线索看相关主机的日志。"))
