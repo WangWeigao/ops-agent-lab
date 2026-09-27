@@ -46,6 +46,8 @@ TOOL_SCHEMAS = [
                     "host": {"type": "string", "description": "主机名，如 web-01"}
                 },
                 "required": ["host"],
+                # 多传的参数在校验阶段就拦住，而不是等到 **kwargs 解包时抛 TypeError
+                "additionalProperties": False,
             },
         },
     }
@@ -81,7 +83,12 @@ def run_tool(name: str, args_json: str) -> str:
     if not tool_func:
         return _format_error_message(f"工具 {name} 不存在，可用工具: {list(TOOLS)}")
 
-    args_dict = json.loads(args_json)
+    try:
+        args_dict = json.loads(args_json)
+    except json.JSONDecodeError as e:
+        # 已知异常：信息安全且能指出错误位置，可以直接给模型
+        return _format_error_message(f"参数不是合法 JSON: {e}")
+
     if error := validate_args(name, args_dict):
         return _format_error_message(error)
 
@@ -89,7 +96,9 @@ def run_tool(name: str, args_json: str) -> str:
         result = tool_func(**args_dict)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        return _format_error_message(str(e))
+        # 未知异常：完整堆栈写日志给人排查，给模型的只是类型名 + 截断后的信息
+        logger.exception(f"工具 {name} 执行异常")
+        return _format_error_message(f"{type(e).__name__}: {str(e)[:200]}")
 
 
 
@@ -129,7 +138,7 @@ def run_agent(user_input: str) -> str:
             content = run_tool(func_name, func_args)
             logger.info(f'tool_call_response: {content}')
             messages.append({
-                "role": "tool", "tool_call_id": tool.id, "content": json.dumps(content)
+                "role": "tool", "tool_call_id": tool.id, "content": content
             })
             logger.info(f"messages: {json.dumps(messages, indent=2, ensure_ascii=False)}")
 
