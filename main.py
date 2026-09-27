@@ -136,6 +136,9 @@ def run_tool(name: str, args_json: str) -> str:
 
     try:
         result = tool_func(**args_dict)
+        # 字符串结果（如 get_logs 的日志文本）原样返回；再 dumps 会变成带引号、\n 被转义的一整行
+        if isinstance(result, str):
+            return result
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         # 未知异常：完整堆栈写日志给人排查，给模型的只是类型名 + 截断后的信息

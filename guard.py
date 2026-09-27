@@ -22,7 +22,6 @@ def call_key(name: str, args: dict) -> tuple:
       - 不同主机、不同工具，都是不同的查询
       - 没有特殊规则的工具：所有参数都参与判断，且与参数顺序无关
     """
-    # TODO(human)
     if name == 'get_logs':
         args = {k: v for k, v in args.items() if k != "lines"}
     return name, json.dumps(args, sort_keys=True)
