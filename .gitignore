@@ -12,3 +12,4 @@ wheels/
 # IDE / secrets
 .idea/
 .env
+logs/
