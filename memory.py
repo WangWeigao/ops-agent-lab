@@ -5,6 +5,10 @@ from dataclasses import dataclass
 MAX_NOTES = 20  # 笔记本身也会无限增长，超出后丢弃最早的
 NOTES_PREFIX = "[排查笔记]"
 
+# 第 4 课（下）：记忆类型决定过期速度
+VOLATILE = "状态"   # 磁盘使用率、连接数等，几小时就可能变
+STABLE = "结构"     # 依赖关系、缺索引等，很少变
+
 RECORD_FINDING_SCHEMA = {
     "type": "function",
     "function": {
@@ -16,8 +20,11 @@ RECORD_FINDING_SCHEMA = {
             "properties": {
                 "finding": {"type": "string", "description": "发现，一句话，保留具体数值"},
                 "evidence": {"type": "string", "description": "依据：哪个工具、哪台主机、哪条原始结果"},
+                "host": {"type": "string", "description": "这条发现属于哪台主机，如 web-01"},
+                "kind": {"type": "string", "enum": [VOLATILE, STABLE],
+                         "description": f"{VOLATILE}：会随时间变化的指标（磁盘、连接数）；{STABLE}：很少变化的事实（依赖关系、表结构）"},
             },
-            "required": ["finding", "evidence"],
+            "required": ["finding", "evidence", "host", "kind"],
             "additionalProperties": False,
         },
     },
@@ -28,6 +35,8 @@ RECORD_FINDING_SCHEMA = {
 class Note:
     finding: str
     evidence: str
+    host: str = ""
+    kind: str = VOLATILE
 
 
 class Notebook:
@@ -36,9 +45,9 @@ class Notebook:
     def __init__(self) -> None:
         self.notes: list[Note] = []
 
-    def add(self, finding: str, evidence: str) -> dict:
+    def add(self, finding: str, evidence: str, host: str = "", kind: str = VOLATILE) -> dict:
         """record_finding 工具的实现。"""
-        self.notes.append(Note(finding, evidence))
+        self.notes.append(Note(finding, evidence, host, kind))
         dropped = max(0, len(self.notes) - MAX_NOTES)
         self.notes = self.notes[dropped:]
         return {"recorded": True, "total_notes": len(self.notes)}

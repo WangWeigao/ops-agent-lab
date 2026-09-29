@@ -1,4 +1,4 @@
-"""阶段 1 · 第 1–4 课：最小 Agent 循环 + 上下文管理 + 重复调用检测 + 笔记记忆（同步版，不用任何 Agent 框架）
+"""阶段 1 · 第 1–4 课：最小 Agent 循环 + 上下文管理 + 重复调用检测 + 笔记与长期记忆（同步版，不用任何 Agent 框架）
 
 运行前：
     uv sync
@@ -17,8 +17,9 @@ from openai import OpenAI
 import jsonschema
 from dotenv import load_dotenv
 
-from context import manage_context, summarize_context
+from context import CONTEXT_THRESHOLD, manage_context, summarize_context
 from guard import RepeatGuard, Verdict
+from long_term import RECALL_MEMORY_SCHEMA, MemoryStore
 from memory import RECORD_FINDING_SCHEMA, Notebook, with_notes
 
 load_dotenv()
@@ -142,8 +143,8 @@ TOOL_SCHEMAS = [
     },
 ]
 
-# 第 4 课：record_finding 的实现绑定在每次 run_agent 的 Notebook 上，这里只登记 schema
-TOOL_SCHEMAS.append(RECORD_FINDING_SCHEMA)
+# 第 4 课：record_finding / recall_memory 的实现绑定在每次运行的 Notebook / MemoryStore 上，这里只登记 schema
+TOOL_SCHEMAS.extend([RECORD_FINDING_SCHEMA, RECALL_MEMORY_SCHEMA])
 
 # 按工具名索引 schema，避免每次都遍历列表
 SCHEMA_BY_NAME = {s["function"]["name"]: s["function"]["parameters"] for s in TOOL_SCHEMAS}
@@ -222,25 +223,31 @@ def summarize_steps(steps: list) -> str:
     return summary
 
 
-def compress(messages: list, last_prompt_tokens: int) -> list:
-    """第 2 课用策略①，第 3 课切换为策略③。"""
+def compress(messages: list, last_prompt_tokens: int, notebook: Notebook) -> list:
+    """分层压缩（第 4 课实验得出）：默认策略①占位，笔记负责保留结论；
+    token 超过 2 倍阈值，或者笔记为空（模型没记，不能只靠笔记）时，才用策略③摘要兜底。"""
     # 先记下压缩前的规模：manage_context 是原地修改，调用之后就看不到原来的了
     before_count, before_chars = len(messages), _total_chars(messages)
-    # new_messages = manage_context(messages, last_prompt_tokens)
-    new_messages = summarize_context(messages, last_prompt_tokens, summarize_steps)
+    if last_prompt_tokens > 2 * CONTEXT_THRESHOLD or not notebook.notes:
+        strategy = "③摘要"
+        new_messages = summarize_context(messages, last_prompt_tokens, summarize_steps)
+    else:
+        strategy = "①占位"
+        new_messages = manage_context(messages, last_prompt_tokens)
     after_count, after_chars = len(new_messages), _total_chars(new_messages)
     if (before_count, before_chars) != (after_count, after_chars):
-        logger.info(f"上下文压缩（上次 prompt {last_prompt_tokens} tokens）："
+        logger.info(f"上下文压缩 {strategy}（上次 prompt {last_prompt_tokens} tokens）："
                     f"消息 {before_count} → {after_count} 条，字符 {before_chars} → {after_chars}")
     return new_messages
 
 
-def run_agent(user_input: str) -> str:
+def run_agent(user_input: str, store: MemoryStore | None = None) -> str:
     messages = [
         {"role": "system", "content": (
             "你是运维助手。需要数据时调用工具，不要编造。"
             "每得到一个关键发现，就用 record_finding 记录（写明依据），尽量和其他工具在同一轮并行调用。"
             "早期工具结果可能被压缩，以 [排查笔记] 开头的消息始终是最新的笔记。"
+            "排查某台主机前，可以先用 recall_memory 查它的历史记录；历史记录只是线索，状态类信息下结论前必须重新验证。"
         )},
         {"role": "user", "content": user_input},
     ]
@@ -248,8 +255,9 @@ def run_agent(user_input: str) -> str:
     last_prompt_tokens = 0
     guard = RepeatGuard()
     notebook = Notebook()
-    # 本次运行可用的工具：公共工具 + 绑定到本次笔记本的 record_finding
-    tools = {**TOOLS, "record_finding": notebook.add}
+    store = store or MemoryStore()
+    # 本次运行可用的工具：公共工具 + 绑定到本次笔记本 / 记忆库的工具
+    tools = {**TOOLS, "record_finding": notebook.add, "recall_memory": store.recall_text}
 
     global stats
     stats = UsageStats()
@@ -257,6 +265,8 @@ def run_agent(user_input: str) -> str:
     logger.info(f"任务开始：{_preview(user_input, 80)}")
 
     def finish(reason: str, steps: int, answer: str) -> str:
+        saved = store.save_notes(notebook.notes)
+        logger.info(f"长期记忆：写入 {saved} 条，库中共 {len(store.memories)} 条")
         cache_rate = stats.cache_hit_tokens / stats.prompt_tokens if stats.prompt_tokens else 0
         logger.info(f"任务结束：{reason} | {steps} 步 | {stats.requests} 次模型请求 | "
                     f"prompt {stats.prompt_tokens}（缓存命中 {cache_rate:.0%}）+ completion {stats.completion_tokens} tokens | "
@@ -266,7 +276,7 @@ def run_agent(user_input: str) -> str:
     for step in range(1, MAX_STEPS + 1):
         logger.info(f"──── 第 {step}/{MAX_STEPS} 步 ────")
         # 第 2 课：每次请求前按上一次的 prompt_tokens 判断是否压缩
-        messages = compress(messages, last_prompt_tokens)
+        messages = compress(messages, last_prompt_tokens, notebook)
         # 第 4 课：笔记只放进本次请求，不存进 messages
         request_messages = with_notes(messages, notebook)
         # 完整请求内容只写入日志文件，终端不刷屏

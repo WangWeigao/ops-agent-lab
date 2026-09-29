@@ -13,3 +13,4 @@ wheels/
 .idea/
 .env
 logs/
+memory_store.json

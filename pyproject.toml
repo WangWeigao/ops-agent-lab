@@ -8,6 +8,8 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "datetime>=6.0",
+    "humanize>=4.16.0",
     "jsonschema>=4.26.0",
     "loguru>=0.7.3",
     "openai>=3.19.2",
