@@ -14,3 +14,4 @@ wheels/
 .env
 logs/
 memory_store.json
+memory_store.json.lock

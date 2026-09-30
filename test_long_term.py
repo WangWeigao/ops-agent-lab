@@ -62,6 +62,19 @@ def main() -> None:
                              f"实际: {[h.finding for h in hits]}"))
         results.append(check("没有记录时返回明确提示", "没有历史记录" in reloaded.recall_text("cache-01", NOW)))
 
+    # ---------- 第 5 课：并发写入不丢数据 ----------
+    print("\n-- 并发写入 --")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "store.json"
+        MemoryStore(path).save_notes([Note("基线记忆", "e", "web-01", STABLE)], now=NOW - 10 * HOUR)
+        # 复现第 5 课的 bug：两个任务开始时各自加载（都只看到"基线记忆"），之后先后保存
+        store_a, store_b = MemoryStore(path), MemoryStore(path)
+        store_b.save_notes([Note("B 的发现", "e", "db-01", VOLATILE)], now=NOW - HOUR)
+        store_a.save_notes([Note("A 的发现", "e", "web-01", VOLATILE)], now=NOW)
+        findings = sorted(m.finding for m in MemoryStore(path).memories)
+        results.append(check("两个实例先后保存，重新加载后两边的记忆都在",
+                             findings == ["A 的发现", "B 的发现", "基线记忆"], f"实际: {findings}"))
+
     print(f"\n{sum(results)}/{len(results)} 通过")
 
 

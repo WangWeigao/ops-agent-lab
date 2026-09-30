@@ -1,5 +1,7 @@
 """阶段 1 · 第 4 课（下）：长期记忆（跨会话保存笔记，按主机检索）"""
+import fcntl
 import json
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -61,22 +63,44 @@ def format_memory(m: Memory, now: float) -> str:
 
 
 class MemoryStore:
-    """用一个 JSON 文件保存所有记忆。学习用，生产环境可换成数据库。"""
+    """用一个 JSON 文件保存所有记忆，写入时加文件锁。学习用，生产环境可换成数据库。"""
 
     def __init__(self, path: Path = STORE_PATH) -> None:
         self.path = path
-        self.memories: list[Memory] = []
-        if path.exists():
-            self.memories = [Memory(**d) for d in json.loads(path.read_text(encoding="utf-8"))]
+        # 锁单独用一个文件：数据文件每次都会被替换成新文件，锁不能加在会被替换的文件上
+        self.lock_path = path.with_name(path.name + ".lock")
+        self.memories: list[Memory] = self._load()
+
+    def _load(self) -> list[Memory]:
+        if not self.path.exists():
+            return []
+        return [Memory(**d) for d in json.loads(self.path.read_text(encoding="utf-8"))]
+
+    def _write(self, memories: list[Memory]) -> None:
+        """先写临时文件再原子替换：不加锁的读取者（__init__）永远不会读到写了一半的文件。"""
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps([asdict(m) for m in memories], ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, self.path)
 
     def save_notes(self, notes: list[Note], now: float | None = None) -> int:
-        """任务结束时调用：把本次笔记写入长期记忆。没有 host 的笔记无法检索，跳过。"""
+        """任务结束时调用：把本次笔记写入长期记忆。没有 host 的笔记无法检索，跳过。
+
+        第 5 课要求：多个 MemoryStore 实例（多个并发任务）先后保存时，不能覆盖彼此写入的记忆。
+        """
         now = time.time() if now is None else now
         new = [Memory(n.host, n.finding, n.evidence, n.kind, now) for n in notes if n.host]
-        if new:
-            self.memories.extend(new)
-            self.path.write_text(json.dumps([asdict(m) for m in self.memories], ensure_ascii=False, indent=2),
-                                 encoding="utf-8")
+        if not new:
+            return 0
+        # 加锁 → 重新读取 → 合并 → 写回 → 释放锁。
+        # 关键是在锁里重新读取：self.memories 是创建实例时的旧快照，别的实例可能已经写入了新记忆。
+        # fcntl.flock 是进程级的文件锁，同一进程的多个实例、多个进程之间都有效（仅限 macOS / Linux）。
+        with open(self.lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            merged = self._load() + new
+            self._write(merged)
+            # with 结束时关闭文件，锁随之释放
+        self.memories = merged  # 同步成最新的完整列表，finish() 打印的"库中共 N 条"才准确
         return len(new)
 
     def recall(self, host: str) -> list[Memory]:
