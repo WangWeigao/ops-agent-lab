@@ -1,5 +1,5 @@
-"""阶段 1 · 第 2–3 课：上下文管理（策略①：清理旧工具结果；策略③：摘要压缩）"""
-from typing import Callable
+"""阶段 1 · 第 2–3、5 课：上下文管理（策略①：清理旧工具结果；策略③：摘要压缩）"""
+from typing import Awaitable, Callable
 
 CONTEXT_THRESHOLD = 1500  # 测试用的低阈值，生产环境要按模型上下文窗口设置
 KEEP_RECENT_STEPS = 2     # 最近几步的工具结果完整保留
@@ -52,15 +52,32 @@ def summarize_context(messages: list, last_prompt_tokens: int,
     - summarize 由调用方传入：生产环境调用模型，测试时传一个假函数
     - 返回新列表，不修改传入的 messages
     """
-    if last_prompt_tokens <= CONTEXT_THRESHOLD:
+    if not (span := _summary_span(messages, last_prompt_tokens)):
         return messages
+    first, cut = span
+    return _splice_summary(messages, first, cut, summarize(messages[first:cut]))
 
+
+async def summarize_context_async(messages: list, last_prompt_tokens: int,
+                                  summarize: Callable[[list], Awaitable[str]]) -> list:
+    """第 5 课：summarize_context 的 async 版本，summarize 是 async 函数（AsyncOpenAI）。"""
+    if not (span := _summary_span(messages, last_prompt_tokens)):
+        return messages
+    first, cut = span
+    return _splice_summary(messages, first, cut, await summarize(messages[first:cut]))
+
+
+def _summary_span(messages: list, last_prompt_tokens: int) -> tuple[int, int] | None:
+    """要被摘要替换的区间 [first, cut)；不需要压缩时返回 None。同步、异步两个版本共用。"""
+    if last_prompt_tokens <= CONTEXT_THRESHOLD:
+        return None
     starts = [i for i, m in enumerate(messages)
               if m["role"] == "assistant" and m.get("tool_calls")]
     if len(starts) <= KEEP_RECENT_STEPS:
-        return messages
+        return None
+    return starts[0], starts[-KEEP_RECENT_STEPS]
 
-    first, cut = starts[0], starts[-KEEP_RECENT_STEPS]
-    summary = summarize(messages[first:cut])
+
+def _splice_summary(messages: list, first: int, cut: int, summary: str) -> list:
     summary_msg = {"role": "user", "content": f"{SUMMARY_PREFIX}\n{summary}"}
     return messages[:first] + [summary_msg] + messages[cut:]

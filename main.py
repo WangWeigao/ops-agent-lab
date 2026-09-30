@@ -1,45 +1,50 @@
-"""阶段 1 · 第 1–4 课：最小 Agent 循环 + 上下文管理 + 重复调用检测 + 笔记与长期记忆（同步版，不用任何 Agent 框架）
+"""阶段 1 · 第 1–5 课：最小 Agent 循环 + 上下文管理 + 重复调用检测 + 笔记与长期记忆 + asyncio（不用任何 Agent 框架）
 
 运行前：
     uv sync
     在项目根目录的 .env 中写入 DEEPSEEK_API_KEY=你的key（.env 已加入 .gitignore）
 模型名以 DeepSeek 官方文档当前列出的为准。
 """
+import asyncio
+import inspect
 import json
 import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from loguru import logger
-from openai import OpenAI
+from openai import AsyncOpenAI
 import jsonschema
 from dotenv import load_dotenv
 
-from context import CONTEXT_THRESHOLD, manage_context, summarize_context
+from concurrency import error_result, run_concurrently
+from context import CONTEXT_THRESHOLD, manage_context, summarize_context_async
 from guard import RepeatGuard, Verdict
 from long_term import RECALL_MEMORY_SCHEMA, MemoryStore
 from memory import RECORD_FINDING_SCHEMA, Notebook, with_notes
 
 load_dotenv()
-client = OpenAI(
+client = AsyncOpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
     base_url="https://api.deepseek.com",
 )
 MODEL = "deepseek-flash"
 MAX_STEPS = 12
+TOOL_LATENCY = 1.0  # 第 5 课：模拟真实 SSH 调用的耗时（秒），用来观察并发的效果
 
 
 # ---------- 日志 ----------
 def setup_logging() -> None:
     """终端只看关键事件（默认 INFO，可用 LOG_LEVEL 调整）；完整细节（DEBUG）写入 logs/ 目录。"""
     logger.remove()
+    logger.configure(extra={"task": "-"})  # 任务外的日志也有 task 字段，避免格式化报错
     logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"),
-               format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <7}</level> | {message}")
+               format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <7}</level> | <cyan>{extra[task]}</cyan> | {message}")
     logger.add("logs/agent_{time:YYYYMMDD_HHmmss}.log", level="DEBUG", encoding="utf-8",
                retention=20,  # 只保留最近 20 个日志文件
-               format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <7} | {name}:{function}:{line} | {message}")
+               format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <7} | {extra[task]} | {name}:{function}:{line} | {message}")
 
 
 def _preview(text: str | None, limit: int = 120) -> str:
@@ -70,21 +75,19 @@ class UsageStats:
         self.cache_hit_tokens += getattr(usage, "prompt_cache_hit_tokens", 0) or 0
 
 
-# 同步版一次只跑一个任务，用模块级变量即可；改 asyncio 并发时要改成每个任务一份
-stats = UsageStats()
-
-
 # ---------- 工具：实现 + 描述（schema） ----------
-def check_disk(host: str) -> dict:
+async def check_disk(host: str) -> dict:
     """模拟数据，先不接真实服务器。"""
+    await asyncio.sleep(TOOL_LATENCY)
     fake = {"web-01": 91, "db-01": 45}
     if host not in fake:
         raise ValueError(f"unknown host: {host}")
     return {"host": host, "usage_percent": fake[host]}
 
 
-def get_logs(host: str, lines: int = 40) -> str:
+async def get_logs(host: str, lines: int = 40) -> str:
     """模拟日志，故意返回较长内容，用来触发上下文压缩。"""
+    await asyncio.sleep(TOOL_LATENCY)
     templates = {
         "web-01": [
             "INFO  nginx upstream response time 1.2s /api/orders",
@@ -159,16 +162,11 @@ def validate_args(name: str, args: dict) -> str | None:
         return f"参数校验失败: {e.message}"
 
 
-def _format_error_message(message: str) -> str:
-    return json.dumps(
-        {
-            "error": True,
-            "message": message
-        }, ensure_ascii=False
-    )
+# 第 5 课：错误格式挪到 concurrency.error_result，超时等并发层的错误也用同一个格式
+_format_error_message = error_result
 
 
-def run_tool(name: str, args_json: str, tools: dict = TOOLS) -> str:
+async def run_tool(name: str, args_json: str, tools: dict = TOOLS) -> str:
     # TODO 1: 解析 args_json，调用 TOOLS[name]，把结果转成 JSON 字符串返回。
     # 要求：工具不存在、参数解析失败、工具抛异常，这三种情况都不能让程序崩溃，
     #       而是把错误信息作为字符串返回。
@@ -187,6 +185,9 @@ def run_tool(name: str, args_json: str, tools: dict = TOOLS) -> str:
 
     try:
         result = tool_func(**args_dict)
+        # 第 5 课：工具可以是 async（get_logs）也可以是普通函数（record_finding），两种都支持
+        if inspect.isawaitable(result):
+            result = await result
         # 字符串结果（如 get_logs 的日志文本）原样返回；再 dumps 会变成带引号、\n 被转义的一整行
         if isinstance(result, str):
             return result
@@ -207,9 +208,9 @@ SUMMARY_PROMPT = """你是运维排查记录员。下面是一段 Agent 排查�
 """
 
 
-def summarize_steps(steps: list) -> str:
+async def summarize_steps(steps: list, stats: UsageStats) -> str:
     """策略③的 summarize 实现：额外调用一次模型生成摘要。"""
-    resp = client.chat.completions.create(
+    resp = await client.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": SUMMARY_PROMPT},
@@ -223,14 +224,15 @@ def summarize_steps(steps: list) -> str:
     return summary
 
 
-def compress(messages: list, last_prompt_tokens: int, notebook: Notebook) -> list:
+async def compress(messages: list, last_prompt_tokens: int, notebook: Notebook,
+                   summarize: Callable[[list], Awaitable[str]]) -> list:
     """分层压缩（第 4 课实验得出）：默认策略①占位，笔记负责保留结论；
     token 超过 2 倍阈值，或者笔记为空（模型没记，不能只靠笔记）时，才用策略③摘要兜底。"""
     # 先记下压缩前的规模：manage_context 是原地修改，调用之后就看不到原来的了
     before_count, before_chars = len(messages), _total_chars(messages)
     if last_prompt_tokens > 2 * CONTEXT_THRESHOLD or not notebook.notes:
         strategy = "③摘要"
-        new_messages = summarize_context(messages, last_prompt_tokens, summarize_steps)
+        new_messages = await summarize_context_async(messages, last_prompt_tokens, summarize)
     else:
         strategy = "①占位"
         new_messages = manage_context(messages, last_prompt_tokens)
@@ -241,7 +243,14 @@ def compress(messages: list, last_prompt_tokens: int, notebook: Notebook) -> lis
     return new_messages
 
 
-def run_agent(user_input: str, store: MemoryStore | None = None) -> str:
+async def run_agent(user_input: str, store: MemoryStore | None = None, name: str = "agent") -> str:
+    """并发跑多个任务时，用 name 区分日志。contextualize 基于 contextvars，
+    本任务里调用的所有函数（摘要、压缩、工具）打的日志都会自动带上 task 字段。"""
+    with logger.contextualize(task=name):
+        return await _run_agent(user_input, store)
+
+
+async def _run_agent(user_input: str, store: MemoryStore | None) -> str:
     messages = [
         {"role": "system", "content": (
             "你是运维助手。需要数据时调用工具，不要编造。"
@@ -259,8 +268,9 @@ def run_agent(user_input: str, store: MemoryStore | None = None) -> str:
     # 本次运行可用的工具：公共工具 + 绑定到本次笔记本 / 记忆库的工具
     tools = {**TOOLS, "record_finding": notebook.add, "recall_memory": store.recall_text}
 
-    global stats
+    # 第 5 课：用量统计每个任务一份，并发跑多个任务时才不会混在一起
     stats = UsageStats()
+    summarize = lambda steps: summarize_steps(steps, stats)  # noqa: E731
     started = time.perf_counter()
     logger.info(f"任务开始：{_preview(user_input, 80)}")
 
@@ -276,14 +286,14 @@ def run_agent(user_input: str, store: MemoryStore | None = None) -> str:
     for step in range(1, MAX_STEPS + 1):
         logger.info(f"──── 第 {step}/{MAX_STEPS} 步 ────")
         # 第 2 课：每次请求前按上一次的 prompt_tokens 判断是否压缩
-        messages = compress(messages, last_prompt_tokens, notebook)
+        messages = await compress(messages, last_prompt_tokens, notebook, summarize)
         # 第 4 课：笔记只放进本次请求，不存进 messages
         request_messages = with_notes(messages, notebook)
         # 完整请求内容只写入日志文件，终端不刷屏
         logger.debug(f"请求 messages:\n{json.dumps(request_messages, indent=2, ensure_ascii=False)}")
 
         t0 = time.perf_counter()
-        resp = client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model=MODEL, messages=request_messages, tools=TOOL_SCHEMAS
         )
         stats.add(resp.usage)
@@ -309,6 +319,9 @@ def run_agent(user_input: str, store: MemoryStore | None = None) -> str:
 
         # TODO 4: 遍历 msg.tool_calls，用 run_tool 执行每一个，
         #         再以 {"role": "tool", "tool_call_id": ..., "content": ...} 追加结果
+        # 第 5 课：先按顺序过一遍重复检测（guard 有状态，顺序要确定），再并发执行需要执行的调用
+        contents: list[str | None] = []
+        jobs = []
         for tool in msg.tool_calls:
             func_name = tool.function.name
             func_args = tool.function.arguments
@@ -321,19 +334,28 @@ def run_agent(user_input: str, store: MemoryStore | None = None) -> str:
             if verdict is Verdict.WARN:
                 # 不执行工具，但必须回一条 tool 消息，否则 tool_call_id 配对会断
                 logger.warning(f"  ! 重复调用 {func_name} 第 {n} 次，未执行，返回提醒")
-                content = _format_error_message(
+                contents.append(_format_error_message(
                     f"重复查询：这是第 {n} 次以相同目标调用 {func_name}，未执行。"
                     f"之前的结果可能已被压缩，请查看以 [早期排查摘要] 开头的消息；"
                     f"信息足够就直接给出结论，再次重复将中止任务。"
-                )
+                ))
             else:
-                t0 = time.perf_counter()
-                content = run_tool(func_name, func_args, tools)
-                elapsed = time.perf_counter() - t0
-                if content.startswith('{"error": true'):
-                    logger.warning(f"  ← {func_name} 失败 {elapsed:.2f}s | {_preview(content)}")
-                else:
-                    logger.info(f"  ← {func_name} {len(content)} 字符 {elapsed:.2f}s | {_preview(content, 80)}")
+                contents.append(None)  # 占位，并发执行后填入
+                jobs.append(lambda fn=func_name, fa=func_args: run_tool(fn, fa, tools))
+
+        t0 = time.perf_counter()
+        results = iter(await run_concurrently(jobs))
+        if jobs:
+            logger.info(f"  并发执行 {len(jobs)} 个工具，共 {time.perf_counter() - t0:.2f}s")
+        contents = [c if c is not None else next(results) for c in contents]
+
+        # 按 tool_calls 的原顺序追加结果
+        for tool, content in zip(msg.tool_calls, contents):
+            func_name = tool.function.name
+            if content.startswith('{"error": true'):
+                logger.warning(f"  ← {func_name} 失败 | {_preview(content)}")
+            else:
+                logger.info(f"  ← {func_name} {len(content)} 字符 | {_preview(content, 80)}")
             logger.debug(f"工具结果 {func_name}（{tool.id}）:\n{content}")
             messages.append({
                 "role": "tool", "tool_call_id": tool.id, "content": content
@@ -342,10 +364,14 @@ def run_agent(user_input: str, store: MemoryStore | None = None) -> str:
     return finish("达到最大步数", MAX_STEPS, "达到最大步数，任务未完成")
 
 
+async def main() -> None:
+    # 第 1 课
+    # print(await run_agent("web-01 和 db-01 的磁盘哪个需要处理？"))
+    # print(await run_agent("查一下 cache-01 的磁盘"))
+    # 第 2 课：需要多步排查、会拉多次日志，用来触发上下文压缩
+    print(await run_agent("web-01 上的订单接口最近很慢，帮我排查根因。先看 web-01 的日志和磁盘，再根据线索看相关主机的日志。"))
+
+
 if __name__ == "__main__":
     setup_logging()
-    # 第 1 课
-    # print(run_agent("web-01 和 db-01 的磁盘哪个需要处理？"))
-    # print(run_agent("查一下 cache-01 的磁盘"))
-    # 第 2 课：需要多步排查、会拉多次日志，用来触发上下文压缩
-    print(run_agent("web-01 上的订单接口最近很慢，帮我排查根因。先看 web-01 的日志和磁盘，再根据线索看相关主机的日志。"))
+    asyncio.run(main())
