@@ -30,5 +30,25 @@ def compress_node(state: MessagesState) -> dict:
       - 只返回"要改的那几条"：{"messages": [新的 ToolMessage, ...]}，不要返回完整列表
       - 已经是 PLACEHOLDER 的不用再返回
     """
-    # TODO(human)
-    return {}
+    messages = state["messages"]
+
+    # 1. 没超阈值 → 不压缩（和阶段 1 一样，只是 token 数从 State 里的消息上取）
+    if last_prompt_tokens(messages) <= CONTEXT_THRESHOLD:
+        return {}
+
+    # 2. 找出每一步的起点。阶段 1 判断 m["role"] == "assistant"，这里消息是对象，用 isinstance
+    starts = [i for i, m in enumerate(messages) if isinstance(m, AIMessage) and m.tool_calls]
+    if len(starts) <= KEEP_RECENT_STEPS:
+        return {}
+    cut = starts[-KEEP_RECENT_STEPS]  # 边界：倒数第 N 步的起点，它之前的都是"较早的步骤"
+
+    # 3. 边界之前的工具结果换成占位文字。
+    #    阶段 1 是原地修改 m["content"]；这里要新建一条消息，并且带上原消息的 id：
+    #    add_messages 看到相同的 id 会原地替换，没有 id 就会被追加到末尾。
+    replaced = [
+        ToolMessage(PLACEHOLDER, id=m.id, tool_call_id=m.tool_call_id, name=m.name)
+        for m in messages[:cut]
+        if isinstance(m, ToolMessage) and m.content != PLACEHOLDER  # 已经换过的不用再返回
+    ]
+    # 只返回要改的那几条，不返回完整列表
+    return {"messages": replaced} if replaced else {}
