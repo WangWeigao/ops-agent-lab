@@ -1,4 +1,4 @@
-"""阶段 2 · 第 2 课（上）：compress + ToolNode 图的离线测试，不调用 API。
+"""阶段 2 · 第 2 课：完整的图（compress + ToolNode + 笔记 + 重复检测）的离线测试，不调用 API。
 
 运行：uv run python -m stage2.test_agent
 """
@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 import concurrency
 import main as stage1
 from context import CONTEXT_THRESHOLD, PLACEHOLDER
+from memory import NOTES_PREFIX
 from stage2.agent import build_graph, tool_error_message
 from stage2.test_basic import ScriptedModel, call
 
@@ -83,7 +84,7 @@ async def main() -> None:
                 call("check_disk", {"host": "web-01"}, "b")], tokens=over),
             ai([call("get_logs", {"host": "db-01", "lines": 2}, "c")], tokens=over),
             ai([call("check_disk", {"host": "db-01"}, "d")], tokens=over),
-            ai([call("get_logs", {"host": "web-01", "lines": 1}, "e")], tokens=over),
+            ai([call("check_disk", {"host": "db-02"}, "e")], tokens=over),
             ai(text="根因是缺索引", tokens=over),
         ])
 
@@ -92,8 +93,9 @@ async def main() -> None:
         async for update in build_graph(script()).astream({"messages": [HumanMessage("排查")]},
                                                           stream_mode="updates"):
             nodes += list(update)
-        results.append(check("节点顺序：compress → agent → tools → compress → ...",
-                             nodes[:5] == ["compress", "agent", "tools", "compress", "agent"], f"实际: {nodes[:6]}"))
+        results.append(check("节点顺序：begin_turn → compress → agent → guard → tools → compress → ...",
+                             nodes[:7] == ["begin_turn", "compress", "agent", "guard", "tools", "compress", "agent"],
+                             f"实际: {nodes[:8]}"))
 
         model = script()
         out = await build_graph(model).ainvoke({"messages": [HumanMessage("排查")]})
@@ -110,6 +112,113 @@ async def main() -> None:
                              all(seen.get(k) == PLACEHOLDER for k in "abc"), f"模型看到: {seen}"))
     except Exception as e:
         results.append(check("压缩在图里生效", False, f"{type(e).__name__}: {e}"))
+
+    # ---------- 笔记 ----------
+    print("\n-- 笔记 --")
+
+    def note(n: int, id_: str) -> dict:
+        return call("record_finding", {"finding": f"发现{n}", "evidence": f"依据{n}", "host": "web-01", "kind": "状态"}, id_)
+
+    # 4. 同一步里并行记两条笔记 + 一个普通工具
+    model = ScriptedModel([
+        ai([note(1, "a"), call("check_disk", {"host": "web-01"}, "b"), note(2, "c")]),
+        ai([note(3, "d")]),
+        ai(text="结论"),
+    ])
+    try:
+        out = await build_graph(model).ainvoke({"messages": [HumanMessage("排查")]})
+        results.append(check("并行的 record_finding 都写进了 State 的 notes，顺序不变",
+                             [n["finding"] for n in out.get("notes", [])] == ["发现1", "发现2", "发现3"],
+                             f"实际: {out.get('notes')}"))
+        tools = [m.tool_call_id for m in out["messages"] if isinstance(m, ToolMessage)]
+        results.append(check("record_finding 也有配对的 ToolMessage", tools == ["a", "b", "c", "d"], f"实际: {tools}"))
+        results.append(check("第一次请求没有笔记消息",
+                             not any(str(m.content).startswith(NOTES_PREFIX) for m in model.calls[0])))  # system prompt 里也提到了笔记，所以用 startswith
+        last = model.calls[-1][-1]
+        results.append(check("之后的请求末尾带着全部笔记",
+                             isinstance(last, HumanMessage) and all(f"发现{i}" in last.content for i in (1, 2, 3)),
+                             f"最后一条: {type(last).__name__} {str(last.content)[:80]!r}"))
+        results.append(check("笔记消息没有写进 State 的 messages（只存在于每次请求里）",
+                             not any(str(m.content).startswith(NOTES_PREFIX) for m in out["messages"])))
+    except Exception as e:
+        results.append(check("笔记写进 State 并出现在请求里", False, f"{type(e).__name__}: {str(e)[:200]}"))
+
+    # 5. 笔记随 checkpoint 保存：同一个 thread 的第二轮对话还能看到
+    try:
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        model = ScriptedModel([ai([note(1, "a")]), ai(text="第一轮结论"), ai(text="第二轮结论")])
+        graph, config = build_graph(model, InMemorySaver()), {"configurable": {"thread_id": "t1"}}
+        await graph.ainvoke({"messages": [HumanMessage("排查")]}, config)
+        await graph.ainvoke({"messages": [HumanMessage("再看看")]}, config)
+        results.append(check("同一个 thread 的下一轮对话仍然带着上一轮的笔记",
+                             "发现1" in str(model.calls[-1][-1].content), f"最后一条: {model.calls[-1][-1]!r}"[:200]))
+    except Exception as e:
+        results.append(check("笔记随 checkpoint 保存", False, f"{type(e).__name__}: {str(e)[:200]}"))
+
+    # ---------- 重复检测 ----------
+    print("\n-- 重复检测 --")
+    disk = {"host": "web-01"}
+
+    # 6. 第 2 次：不执行，返回提醒；其他调用正常执行
+    model = ScriptedModel([
+        ai([call("check_disk", disk, "a")]),
+        ai([call("check_disk", disk, "b"), call("check_disk", {"host": "db-01"}, "c")]),
+        ai(text="结论"),
+    ])
+    try:
+        out = await build_graph(model).ainvoke({"messages": [HumanMessage("查")]})
+        tools = {m.tool_call_id: m.content for m in out["messages"] if isinstance(m, ToolMessage)}
+        results.append(check("第 2 次相同查询不执行，返回提醒；同一步里的其他调用正常执行",
+                             "重复查询" in tools["b"] and "usage_percent" in tools["a"] and "usage_percent" in tools["c"],
+                             f"实际: {tools}"))
+        results.append(check("计数保存在 State 的 call_counts 里",
+                             sorted(out["call_counts"].values()) == [1, 2], f"实际: {out.get('call_counts')}"))
+    except Exception as e:
+        results.append(check("第 2 次相同查询返回提醒", False, f"{type(e).__name__}: {str(e)[:200]}"))
+
+    # 7. get_logs 只换 lines 也算重复；同一步里重复两次：第一个执行，第二个被拦下
+    model = ScriptedModel([
+        ai([call("get_logs", {"host": "web-01", "lines": 2}, "a"), call("get_logs", {"host": "web-01", "lines": 5}, "b")]),
+        ai(text="结论"),
+    ])
+    try:
+        out = await build_graph(model).ainvoke({"messages": [HumanMessage("查")]})
+        tools = {m.tool_call_id: m.content for m in out["messages"] if isinstance(m, ToolMessage)}
+        results.append(check("同一步里的重复调用：第一个执行，第二个被拦下",
+                             "重复查询" not in tools["a"] and "重复查询" in tools["b"], f"实际: {tools}"))
+    except Exception as e:
+        results.append(check("同一步里的重复调用", False, f"{type(e).__name__}: {str(e)[:200]}"))
+
+    # 8. 第 3 次：中止。图正常结束（不是抛异常），配对完整
+    model = ScriptedModel([ai([call("check_disk", disk, "x")])], repeat_last=True)
+    try:
+        out = await build_graph(model).ainvoke({"messages": [HumanMessage("查")]}, config={"recursion_limit": 50})
+        msgs = out["messages"]
+        results.append(check("第 3 次相同查询：任务中止，模型只被调用了 3 次",
+                             len(model.calls) == 3 and "中止" in msgs[-1].content and not msgs[-1].tool_calls,
+                             f"模型调用 {len(model.calls)} 次，最后一条: {msgs[-1].content!r}"))
+        asked = [c["id"] for m in msgs if isinstance(m, AIMessage) for c in m.tool_calls]
+        answered = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
+        results.append(check("中止后每个 tool_call 仍有配对的 ToolMessage", len(asked) == len(answered) == 3,
+                             f"tool_calls {len(asked)} 个，ToolMessage {len(answered)} 条"))
+    except Exception as e:
+        results.append(check("第 3 次相同查询中止任务", False, f"{type(e).__name__}: {str(e)[:200]}"))
+
+    # 9. 计数只在一轮提问内有效：同一个 thread 的下一轮提问，可以重新查同一台主机
+    model = ScriptedModel([ai([call("check_disk", disk, "a")]), ai(text="91%"),
+                           ai([call("check_disk", disk, "b")]), ai(text="清理后正常")])
+    try:
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        graph, config = build_graph(model, InMemorySaver()), {"configurable": {"thread_id": "t2"}}
+        await graph.ainvoke({"messages": [HumanMessage("web-01 磁盘怎么样")]}, config)
+        out = await graph.ainvoke({"messages": [HumanMessage("清理完了，再看看")]}, config)
+        tools = {m.tool_call_id: m.content for m in out["messages"] if isinstance(m, ToolMessage)}
+        results.append(check("同一个 thread 的下一轮提问：计数清零，相同查询正常执行",
+                             "usage_percent" in tools["b"], f"实际: {tools['b'][:60]}"))
+    except Exception as e:
+        results.append(check("下一轮提问计数清零", False, f"{type(e).__name__}: {str(e)[:200]}"))
 
     print(f"\n{sum(results)}/{len(results)} 通过")
 
