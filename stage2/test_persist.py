@@ -10,7 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 import main as stage1
 from stage2 import persist
 from stage2.agent import build_graph
-from stage2.persist import Ledger, is_unfinished, run_once
+from stage2.persist import Ledger, has_side_effects, is_unfinished, run_once
 from stage2.test_agent import ai
 from stage2.test_basic import ScriptedModel, call
 
@@ -50,8 +50,15 @@ async def attempt(ledger, key, execute):
 async def main() -> None:
     results = []
 
+    # ---------- 工具分类 ----------
+    print("-- 工具分类 --")
+    results.append(check("只读工具和 record_finding 不需要记账",
+                         not any(has_side_effects(n) for n in ("get_logs", "check_disk", "record_finding"))))
+    results.append(check("restart_service 需要记账", has_side_effects("restart_service")))
+    results.append(check("没登记过的新工具：默认按有副作用处理", has_side_effects("delete_pod")))
+
     # ---------- run_once ----------
-    print("-- run_once --")
+    print("\n-- run_once --")
     ledger, ex = Ledger(":memory:"), Executor()
     msg, err = await attempt(ledger, "t:c1", ex)
     ok = err is None and isinstance(msg, ToolMessage)

@@ -36,7 +36,16 @@ async def restart_service(host: str, service: str) -> str:
     return f"{host} 上的 {service} 已重启"
 
 
-WRITE_TOOLS = {"restart_service"}  # 只有写操作需要记账；只读工具重新执行一次没有影响，结果还更新
+# 没有外部副作用的工具：重新执行一次没有影响，不需要记账（下一课：也不需要审批）。
+#   get_logs / check_disk  只读
+#   record_finding         只改 State，随节点一起成功或一起作废，不存在"部分完成"
+# 写成"安全名单"而不是"危险名单"：新加的工具忘了登记时，按有副作用处理（多一次保护），
+# 而不是不经任何保护直接执行。这份名单由人维护，不让模型判断，也不直接采信工具自己的声明。
+NO_SIDE_EFFECT_TOOLS = {"get_logs", "check_disk", "record_finding"}
+
+
+def has_side_effects(tool_name: str) -> bool:
+    return tool_name not in NO_SIDE_EFFECT_TOOLS
 
 
 # ---------- 账本 ----------

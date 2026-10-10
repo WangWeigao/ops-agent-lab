@@ -27,7 +27,7 @@ import concurrency
 import main as stage1
 from stage2 import basic
 from stage2.compress import compress_node
-from stage2.persist import WRITE_TOOLS, Ledger, restart_service, run_once
+from stage2.persist import Ledger, has_side_effects, restart_service, run_once
 from stage2.repeat import guard_node, warn_text
 from stage2.state import AgentState, record_finding, render_notes
 
@@ -92,8 +92,8 @@ def make_tools_node(ledger: Ledger | None = None) -> ToolNode:
                     return ToolMessage(f"工具执行超时（超过 {concurrency.TOOL_TIMEOUT}s）",
                                        tool_call_id=call["id"], name=call["name"], status="error")
 
-        if ledger is not None and call["name"] in WRITE_TOOLS:
-            # 第 3 课：写操作先查账。tool_call_id 是模型生成的，同一次调用在恢复前后不变
+        if ledger is not None and has_side_effects(call["name"]):
+            # 第 3 课：有副作用的操作先查账。tool_call_id 是模型生成的，同一次调用在恢复前后不变
             thread_id = request.runtime.config.get("configurable", {}).get("thread_id", "")
             result = await run_once(ledger, f"{thread_id}:{call['id']}", call, execute)
         else:
