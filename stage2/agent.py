@@ -10,6 +10,8 @@
     Notebook                      → State 的 notes 字段 + record_finding 工具（stage2/state.py）
     RepeatGuard                   → State 的 call_counts 字段 + guard 节点（stage2/repeat.py）
 
+第 3 课：持久化的 checkpoint、断点续跑、写操作的幂等，见 stage2/persist.py
+
 运行：uv run python -m stage2.agent
 """
 import asyncio
@@ -25,10 +27,11 @@ import concurrency
 import main as stage1
 from stage2 import basic
 from stage2.compress import compress_node
+from stage2.persist import WRITE_TOOLS, Ledger, restart_service, run_once
 from stage2.repeat import guard_node, warn_text
 from stage2.state import AgentState, record_finding, render_notes
 
-TOOLS = [*basic.TOOLS, record_finding]
+TOOLS = [*basic.TOOLS, record_finding, restart_service]
 SYSTEM_PROMPT = ("你是运维助手。需要数据时调用工具，不要编造。"
                  "每得到一个关键发现，就用 record_finding 记录（写明依据），尽量和其他工具在同一轮并行调用。"
                  "较早的工具结果可能被省略，这时以 [排查笔记] 为准，不要重复查询。")
@@ -66,8 +69,8 @@ def tool_error_message(e: Exception) -> str:
     return f"{type(e).__name__}: {str(e)[:200]}"
 
 
-def make_tools_node() -> ToolNode:
-    """官方 ToolNode，加上超时、并发上限和日志。"""
+def make_tools_node(ledger: Ledger | None = None) -> ToolNode:
+    """官方 ToolNode，加上超时、并发上限和日志。传入 ledger 时，写操作保证最多执行一次（第 3 课）。"""
     # 信号量放在闭包里：每个图一份，不同的图（不同的任务）互不影响
     sem = asyncio.Semaphore(concurrency.MAX_CONCURRENCY)
 
@@ -79,13 +82,22 @@ def make_tools_node() -> ToolNode:
             return ToolMessage(warn_text(call["name"], n), tool_call_id=call["id"], name=call["name"])
         logger.info(f"  → {call['name']} {call['args']}")
         t0 = time.perf_counter()
-        async with sem:  # 和阶段 1 一样：先排队拿到名额，再开始计时
-            try:
-                result = await asyncio.wait_for(handler(request), concurrency.TOOL_TIMEOUT)
-            except asyncio.TimeoutError:
-                # 超时发生在这一层，ToolNode 的错误处理管不到，要自己返回 ToolMessage 来保持配对
-                result = ToolMessage(f"工具执行超时（超过 {concurrency.TOOL_TIMEOUT}s）",
-                                     tool_call_id=call["id"], name=call["name"], status="error")
+
+        async def execute():
+            async with sem:  # 和阶段 1 一样：先排队拿到名额，再开始计时
+                try:
+                    return await asyncio.wait_for(handler(request), concurrency.TOOL_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # 超时发生在这一层，ToolNode 的错误处理管不到，要自己返回 ToolMessage 来保持配对
+                    return ToolMessage(f"工具执行超时（超过 {concurrency.TOOL_TIMEOUT}s）",
+                                       tool_call_id=call["id"], name=call["name"], status="error")
+
+        if ledger is not None and call["name"] in WRITE_TOOLS:
+            # 第 3 课：写操作先查账。tool_call_id 是模型生成的，同一次调用在恢复前后不变
+            thread_id = request.runtime.config.get("configurable", {}).get("thread_id", "")
+            result = await run_once(ledger, f"{thread_id}:{call['id']}", call, execute)
+        else:
+            result = await execute()
         # 工具返回的可能是 ToolMessage，也可能是 Command（record_finding），后者的消息在 update 里
         msg = result if isinstance(result, ToolMessage) else result.update["messages"][-1]
         log = logger.warning if msg.status == "error" else logger.info
@@ -112,13 +124,13 @@ def begin_turn(state: AgentState) -> dict:
     return {"call_counts": {}, "blocked": {}}
 
 
-def build_graph(model, checkpointer=None):
+def build_graph(model, checkpointer=None, ledger: Ledger | None = None):
     builder = StateGraph(AgentState)
     builder.add_node("begin_turn", begin_turn)
     builder.add_node("compress", compress_node)
     builder.add_node("agent", make_agent_node(model))
     builder.add_node("guard", guard_node)
-    builder.add_node("tools", make_tools_node())
+    builder.add_node("tools", make_tools_node(ledger))
     builder.add_edge(START, "begin_turn")
     builder.add_edge("begin_turn", "compress")
     builder.add_edge("compress", "agent")

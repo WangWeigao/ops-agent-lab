@@ -15,3 +15,5 @@ wheels/
 logs/
 memory_store.json
 memory_store.json.lock
+checkpoints.db*
+ledger.db*
