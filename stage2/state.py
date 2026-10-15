@@ -38,6 +38,8 @@ class AgentState(MessagesState):
     # 下面两个字段只有 guard 节点会写，每步最多写一次 → 不需要 reducer，新值直接覆盖旧值
     call_counts: dict[str, int]  # 每个查询累计被调用的次数，跨步骤累积
     blocked: dict[str, int]      # 只对当前这一步有效：tool_call_id → 第几次重复。这些调用不执行，只返回提醒
+    # 第 4 课：approve 节点写，每步一次。只对当前这一步有效：tool_call_id → 给模型看的拒绝说明
+    rejected: dict[str, str]
 
 
 def render_notes(notes: list[dict]) -> str | None:

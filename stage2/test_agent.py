@@ -93,9 +93,9 @@ async def main() -> None:
         async for update in build_graph(script()).astream({"messages": [HumanMessage("排查")]},
                                                           stream_mode="updates"):
             nodes += list(update)
-        results.append(check("节点顺序：begin_turn → compress → agent → guard → tools → compress → ...",
-                             nodes[:7] == ["begin_turn", "compress", "agent", "guard", "tools", "compress", "agent"],
-                             f"实际: {nodes[:8]}"))
+        results.append(check("节点顺序：begin_turn → compress → agent → guard → approve → tools → compress → ...",
+                             nodes[:8] == ["begin_turn", "compress", "agent", "guard", "approve", "tools", "compress", "agent"],
+                             f"实际: {nodes[:9]}"))
 
         model = script()
         out = await build_graph(model).ainvoke({"messages": [HumanMessage("排查")]})

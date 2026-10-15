@@ -7,15 +7,13 @@
 State 管不到节点内部的"部分完成"，所以要在 State 之外另外记一本账（Ledger）：
 每个写操作执行前登记、执行后记下结果，恢复时先查账。
 
-运行（同一个 thread_id 可以反复运行：没跑完就从断点继续，跑完了就是下一轮对话）：
-    uv run python -m stage2.persist 排查-web01 "web-01 上的订单接口最近很慢，帮我排查根因"
+命令行入口在 stage2/approval.py（第 4 课加了审批后，入口要同时处理"等人审批"这种状态）。
 """
 import asyncio
 import sqlite3
-import sys
 from dataclasses import dataclass
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from loguru import logger
 
@@ -127,35 +125,3 @@ def is_unfinished(snapshot) -> bool:
     这个窗口确实存在），next 是空的，看起来像跑完了，其实没有。tasks 在这种情况下仍然不为空。
     """
     return bool(snapshot.tasks)
-
-
-async def run(thread_id: str, question: str) -> str:
-    from langchain_deepseek import ChatDeepSeek
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
-    from stage2.agent import RECURSION_LIMIT, TOOLS, build_graph
-
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
-    async with AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB) as saver:
-        graph = build_graph(ChatDeepSeek(model=stage1.MODEL).bind_tools(TOOLS), saver, Ledger())
-        snapshot = await graph.aget_state(config)
-        if is_unfinished(snapshot):
-            # 上次没跑完：输入传 None，表示"不给新输入，从最后一个 checkpoint 接着执行"
-            stopped_at = [t.name for t in snapshot.tasks]
-            logger.warning(f"thread {thread_id} 上次停在 {stopped_at}，从断点继续（本次的提问被忽略）")
-            graph_input = None
-        else:
-            turns = sum(isinstance(m, HumanMessage) for m in snapshot.values.get("messages", []))
-            logger.info(f"thread {thread_id}：第 {turns + 1} 轮提问")
-            graph_input = {"messages": [HumanMessage(question)]}
-
-        async for update in graph.astream(graph_input, config, stream_mode="updates"):
-            for node in update:
-                if not node.startswith("__"):  # 恢复时框架会多发一条 __metadata__，不是节点
-                    logger.info(f"[{node}] 完成")
-        final = await graph.aget_state(config)
-        return final.values["messages"][-1].content
-
-
-if __name__ == "__main__":
-    print(asyncio.run(run(sys.argv[1], sys.argv[2])))

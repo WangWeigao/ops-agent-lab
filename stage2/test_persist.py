@@ -6,6 +6,7 @@ import asyncio
 
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 import main as stage1
 from stage2 import persist
@@ -120,7 +121,9 @@ async def main() -> None:
         graph = build_graph(model, InMemorySaver(), Ledger(":memory:"))
         config = {"configurable": {"thread_id": "t1"}}
         try:
+            # 第 4 课之后：重启要先过审批，图会停在 approve 节点；批准后才进入 tools
             await graph.ainvoke({"messages": [HumanMessage("重启 nginx 并看磁盘")]}, config)
+            await graph.ainvoke(Command(resume={"r1": {"action": "approve"}}), config)
             crashed = False
         except Killed:
             crashed = True

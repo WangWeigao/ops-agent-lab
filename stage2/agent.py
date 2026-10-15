@@ -1,7 +1,7 @@
 """阶段 2 · 第 2 课：compress 节点 + 官方 ToolNode + 笔记 + 重复检测
 
-图：START → begin_turn → compress → agent ─(有 tool_calls)→ guard ─(放行)→ tools → compress → ...
-                          └─(没有)→ END        └─(重复第 3 次，中止)→ END
+图：START → begin_turn → compress → agent ─(有 tool_calls)→ guard ─(放行)→ approve → tools → compress → ...
+                                        └─(没有)→ END        └─(重复第 3 次，中止)→ END
 
 对照阶段 1：
     compress()                    → compress 节点（stage2/compress.py）
@@ -11,6 +11,7 @@
     RepeatGuard                   → State 的 call_counts 字段 + guard 节点（stage2/repeat.py）
 
 第 3 课：持久化的 checkpoint、断点续跑、写操作的幂等，见 stage2/persist.py
+第 4 课：有副作用的操作执行前暂停等人审批（approve 节点），见 stage2/approval.py
 
 运行：uv run python -m stage2.agent
 """
@@ -26,6 +27,7 @@ from loguru import logger
 import concurrency
 import main as stage1
 from stage2 import basic
+from stage2.approval import approve_node
 from stage2.compress import compress_node
 from stage2.persist import Ledger, has_side_effects, restart_service, run_once
 from stage2.repeat import guard_node, warn_text
@@ -35,10 +37,10 @@ TOOLS = [*basic.TOOLS, record_finding, restart_service]
 SYSTEM_PROMPT = ("你是运维助手。需要数据时调用工具，不要编造。"
                  "每得到一个关键发现，就用 record_finding 记录（写明依据），尽量和其他工具在同一轮并行调用。"
                  "较早的工具结果可能被省略，这时以 [排查笔记] 为准，不要重复查询。")
-# 现在一轮要经过 4 个节点（compress → agent → guard → tools），recursion_limit 数的是节点执行次数。
-# 第 1 课的 25 在这里只够 6 轮，要跟着图的结构一起调整。
+# 现在一轮要经过 5 个节点（compress → agent → guard → approve → tools），recursion_limit 数的是节点执行次数。
+# 第 1 课的 25 在这里只够 5 轮，要跟着图的结构一起调整。
 MAX_ROUNDS = 12
-RECURSION_LIMIT = MAX_ROUNDS * 4 + 3  # 加上入口的 begin_turn 和最后一次 compress → agent
+RECURSION_LIMIT = MAX_ROUNDS * 5 + 3  # 加上入口的 begin_turn 和最后一次 compress → agent
 
 
 def make_agent_node(model):
@@ -80,6 +82,9 @@ def make_tools_node(ledger: Ledger | None = None) -> ToolNode:
         # guard 节点判定为重复的调用：不执行，直接返回提醒。判定结果是从 State 里读的
         if n := (request.state.get("blocked") or {}).get(call["id"]):
             return ToolMessage(warn_text(call["name"], n), tool_call_id=call["id"], name=call["name"])
+        # 第 4 课：approve 节点里被人拒绝的调用：不执行，把拒绝说明交给模型
+        if reason := (request.state.get("rejected") or {}).get(call["id"]):
+            return ToolMessage(reason, tool_call_id=call["id"], name=call["name"], status="error")
         logger.info(f"  → {call['name']} {call['args']}")
         t0 = time.perf_counter()
 
@@ -109,7 +114,7 @@ def make_tools_node(ledger: Ledger | None = None) -> ToolNode:
 
 def has_tool_calls(state: AgentState) -> bool:
     """最后一条消息是带 tool_calls 的 AIMessage。两条条件边共用这一个判断：
-    agent 之后：模型要调工具 → guard；guard 之后：没有中止（最后一条还是那条 AIMessage）→ tools。"""
+    agent 之后：模型要调工具 → guard；guard 之后：没有中止（最后一条还是那条 AIMessage）→ approve。"""
     last = state["messages"][-1]
     return isinstance(last, AIMessage) and bool(last.tool_calls)
 
@@ -121,7 +126,7 @@ def begin_turn(state: AgentState) -> dict:
     "索引加完了，再看看 web-01 的日志"，这次合理的查询会被当成重复拦下。
     放在入口：START 只在新的输入到来时经过一次；崩溃后恢复不会重新经过，一轮之内的计数不受影响。
     """
-    return {"call_counts": {}, "blocked": {}}
+    return {"call_counts": {}, "blocked": {}, "rejected": {}}
 
 
 def build_graph(model, checkpointer=None, ledger: Ledger | None = None):
@@ -130,12 +135,14 @@ def build_graph(model, checkpointer=None, ledger: Ledger | None = None):
     builder.add_node("compress", compress_node)
     builder.add_node("agent", make_agent_node(model))
     builder.add_node("guard", guard_node)
+    builder.add_node("approve", approve_node)
     builder.add_node("tools", make_tools_node(ledger))
     builder.add_edge(START, "begin_turn")
     builder.add_edge("begin_turn", "compress")
     builder.add_edge("compress", "agent")
     builder.add_conditional_edges("agent", has_tool_calls, {True: "guard", False: END})
-    builder.add_conditional_edges("guard", has_tool_calls, {True: "tools", False: END})
+    builder.add_conditional_edges("guard", has_tool_calls, {True: "approve", False: END})
+    builder.add_edge("approve", "tools")
     builder.add_edge("tools", "compress")  # 工具执行完先经过压缩，再回到模型
     return builder.compile(checkpointer=checkpointer)
 
